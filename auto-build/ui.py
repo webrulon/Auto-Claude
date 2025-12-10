@@ -107,6 +107,7 @@ class Icons:
     FOLDER = ("📁", "[D]")
     FILE = ("📄", "[F]")
     GEAR = ("⚙", "[*]")
+    SEARCH = ("🔍", "[?]")
     BRANCH = ("", "[B]")
     COMMIT = ("◉", "(@)")
     LIGHTNING = ("⚡", "!")
