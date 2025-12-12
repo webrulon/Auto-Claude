@@ -960,6 +960,62 @@ export function ProjectSettings({ project, open, onOpenChange }: ProjectSettings
                             </p>
                           </div>
 
+                          {/* LLM Provider Selection - V2 Multi-provider support */}
+                          <div className="space-y-2">
+                            <Label className="text-sm font-medium text-foreground">LLM Provider</Label>
+                            <p className="text-xs text-muted-foreground">
+                              Provider for graph operations (extraction, search, reasoning)
+                            </p>
+                            <Select
+                              value={envConfig.graphitiProviderConfig?.llmProvider || 'openai'}
+                              onValueChange={(value) => updateEnvConfig({
+                                graphitiProviderConfig: {
+                                  ...envConfig.graphitiProviderConfig,
+                                  llmProvider: value as 'openai' | 'anthropic' | 'google' | 'groq',
+                                }
+                              })}
+                            >
+                              <SelectTrigger>
+                                <SelectValue placeholder="Select LLM provider" />
+                              </SelectTrigger>
+                              <SelectContent>
+                                <SelectItem value="openai">OpenAI (GPT-4o)</SelectItem>
+                                <SelectItem value="anthropic">Anthropic (Claude)</SelectItem>
+                                <SelectItem value="google">Google (Gemini)</SelectItem>
+                                <SelectItem value="groq">Groq (Llama)</SelectItem>
+                              </SelectContent>
+                            </Select>
+                          </div>
+
+                          {/* Embedding Provider Selection */}
+                          <div className="space-y-2">
+                            <Label className="text-sm font-medium text-foreground">Embedding Provider</Label>
+                            <p className="text-xs text-muted-foreground">
+                              Provider for semantic search embeddings
+                            </p>
+                            <Select
+                              value={envConfig.graphitiProviderConfig?.embeddingProvider || 'openai'}
+                              onValueChange={(value) => updateEnvConfig({
+                                graphitiProviderConfig: {
+                                  ...envConfig.graphitiProviderConfig,
+                                  embeddingProvider: value as 'openai' | 'voyage' | 'google' | 'huggingface',
+                                }
+                              })}
+                            >
+                              <SelectTrigger>
+                                <SelectValue placeholder="Select embedding provider" />
+                              </SelectTrigger>
+                              <SelectContent>
+                                <SelectItem value="openai">OpenAI</SelectItem>
+                                <SelectItem value="voyage">Voyage AI</SelectItem>
+                                <SelectItem value="google">Google</SelectItem>
+                                <SelectItem value="huggingface">HuggingFace (Local)</SelectItem>
+                              </SelectContent>
+                            </Select>
+                          </div>
+
+                          <Separator />
+
                           <div className="space-y-2">
                             <div className="flex items-center justify-between">
                               <Label className="text-sm font-medium text-foreground">
@@ -978,7 +1034,7 @@ export function ProjectSettings({ project, open, onOpenChange }: ProjectSettings
                               </p>
                             ) : (
                               <p className="text-xs text-muted-foreground">
-                                Required for Graphiti embeddings
+                                Required when using OpenAI as LLM or embedding provider
                               </p>
                             )}
                             <div className="relative">

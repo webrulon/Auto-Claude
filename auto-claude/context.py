@@ -26,13 +26,27 @@ The context builder will:
 4. Output focused context for AI agents
 """
 
+import asyncio
 import json
 import os
 import re
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 from dataclasses import dataclass, field, asdict
+
+# Import graphiti providers for optional historical hints
+try:
+    from graphiti_providers import get_graph_hints, is_graphiti_enabled
+    GRAPHITI_AVAILABLE = True
+except ImportError:
+    GRAPHITI_AVAILABLE = False
+
+    def is_graphiti_enabled() -> bool:
+        return False
+
+    async def get_graph_hints(query: str, project_id: str, max_results: int = 10) -> list:
+        return []
 
 # Directories to skip
 SKIP_DIRS = {
@@ -67,6 +81,7 @@ class TaskContext:
     files_to_reference: list[dict]
     patterns_discovered: dict[str, str]
     service_contexts: dict[str, dict]
+    graph_hints: list[dict] = field(default_factory=list)  # Historical hints from Graphiti
 
 
 class ContextBuilder:
@@ -75,6 +90,25 @@ class ContextBuilder:
     def __init__(self, project_dir: Path, project_index: dict | None = None):
         self.project_dir = project_dir.resolve()
         self.project_index = project_index or self._load_project_index()
+
+    async def _get_graph_hints(self, task: str) -> list[dict]:
+        """Get historical hints from Graphiti knowledge graph.
+
+        This provides context from past sessions and similar tasks.
+        """
+        if not is_graphiti_enabled():
+            return []
+
+        try:
+            hints = await get_graph_hints(
+                query=task,
+                project_id=str(self.project_dir),
+                max_results=5,
+            )
+            return hints
+        except Exception:
+            # Graphiti is optional - fail gracefully
+            return []
 
     def _load_project_index(self) -> dict:
         """Load project index from file or create new one."""
@@ -92,6 +126,7 @@ class ContextBuilder:
         task: str,
         services: list[str] | None = None,
         keywords: list[str] | None = None,
+        include_graph_hints: bool = True,
     ) -> TaskContext:
         """
         Build context for a specific task.
@@ -100,6 +135,7 @@ class ContextBuilder:
             task: Description of the task
             services: List of service names to search (None = auto-detect)
             keywords: Additional keywords to search for
+            include_graph_hints: Whether to include historical hints from Graphiti
 
         Returns:
             TaskContext with relevant files and patterns
@@ -140,6 +176,23 @@ class ContextBuilder:
         # Discover patterns from reference files
         patterns = self._discover_patterns(files_to_reference, keywords)
 
+        # Get graph hints (synchronously wrap async call)
+        graph_hints = []
+        if include_graph_hints and is_graphiti_enabled():
+            try:
+                # Run the async function in a new event loop if necessary
+                try:
+                    loop = asyncio.get_running_loop()
+                    # We're already in an async context - this shouldn't happen in CLI
+                    # but handle it gracefully
+                    graph_hints = []
+                except RuntimeError:
+                    # No event loop running - create one
+                    graph_hints = asyncio.run(self._get_graph_hints(task))
+            except Exception:
+                # Graphiti is optional - fail gracefully
+                graph_hints = []
+
         return TaskContext(
             task_description=task,
             scoped_services=services,
@@ -147,6 +200,80 @@ class ContextBuilder:
             files_to_reference=[asdict(f) if isinstance(f, FileMatch) else f for f in files_to_reference],
             patterns_discovered=patterns,
             service_contexts=service_contexts,
+            graph_hints=graph_hints,
+        )
+
+    async def build_context_async(
+        self,
+        task: str,
+        services: list[str] | None = None,
+        keywords: list[str] | None = None,
+        include_graph_hints: bool = True,
+    ) -> TaskContext:
+        """
+        Build context for a specific task (async version).
+
+        This version is preferred when called from async code as it can
+        properly await the graph hints retrieval.
+
+        Args:
+            task: Description of the task
+            services: List of service names to search (None = auto-detect)
+            keywords: Additional keywords to search for
+            include_graph_hints: Whether to include historical hints from Graphiti
+
+        Returns:
+            TaskContext with relevant files and patterns
+        """
+        # Auto-detect services if not specified
+        if not services:
+            services = self._suggest_services(task)
+
+        # Extract keywords from task if not provided
+        if not keywords:
+            keywords = self._extract_keywords(task)
+
+        # Search each service
+        all_matches: list[FileMatch] = []
+        service_contexts = {}
+
+        for service_name in services:
+            service_info = self.project_index.get("services", {}).get(service_name)
+            if not service_info:
+                continue
+
+            service_path = Path(service_info.get("path", service_name))
+            if not service_path.is_absolute():
+                service_path = self.project_dir / service_path
+
+            # Search this service
+            matches = self._search_service(service_path, service_name, keywords)
+            all_matches.extend(matches)
+
+            # Load or generate service context
+            service_contexts[service_name] = self._get_service_context(
+                service_path, service_name, service_info
+            )
+
+        # Categorize matches
+        files_to_modify, files_to_reference = self._categorize_matches(all_matches, task)
+
+        # Discover patterns from reference files
+        patterns = self._discover_patterns(files_to_reference, keywords)
+
+        # Get graph hints asynchronously
+        graph_hints = []
+        if include_graph_hints:
+            graph_hints = await self._get_graph_hints(task)
+
+        return TaskContext(
+            task_description=task,
+            scoped_services=services,
+            files_to_modify=[asdict(f) if isinstance(f, FileMatch) else f for f in files_to_modify],
+            files_to_reference=[asdict(f) if isinstance(f, FileMatch) else f for f in files_to_reference],
+            patterns_discovered=patterns,
+            service_contexts=service_contexts,
+            graph_hints=graph_hints,
         )
 
     def _suggest_services(self, task: str) -> list[str]:
@@ -416,6 +543,7 @@ def build_task_context(
         "files_to_reference": context.files_to_reference,
         "patterns": context.patterns_discovered,
         "service_contexts": context.service_contexts,
+        "graph_hints": context.graph_hints,
     }
 
     if output_file:

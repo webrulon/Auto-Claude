@@ -11,6 +11,15 @@ You have access to:
 - Database schemas and queries (if applicable)
 - Build configuration files
 - Memory context from previous sessions (if available)
+- Graph hints from Graphiti knowledge graph (if available)
+
+### Graph Hints Integration
+
+If `graph_hints.json` exists and contains hints for your ideation type (`performance_optimizations`), use them to:
+1. **Avoid duplicates**: Don't suggest optimizations that have already been implemented
+2. **Build on success**: Prioritize optimization patterns that worked well in the past
+3. **Learn from failures**: Avoid optimizations that previously caused regressions
+4. **Leverage context**: Use historical profiling knowledge to identify high-impact areas
 
 ## Your Mission
 

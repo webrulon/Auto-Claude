@@ -50,6 +50,9 @@ cat memory/patterns.md 2>/dev/null || echo "No patterns documented"
 
 # Look at existing roadmap if available
 cat ../roadmap/roadmap.json 2>/dev/null | head -100 || echo "No roadmap"
+
+# Check for graph hints (historical insights from Graphiti)
+cat graph_hints.json 2>/dev/null || echo "No graph hints available"
 ```
 
 Understand:
@@ -57,6 +60,15 @@ Understand:
 - What features already exist?
 - What patterns are established?
 - What is already planned (to avoid duplicates)?
+- What historical insights are available from previous sessions?
+
+### Graph Hints Integration
+
+If `graph_hints.json` exists and contains hints for your ideation type (`low_hanging_fruit`), use them to:
+1. **Avoid duplicates**: Don't suggest ideas that have already been tried or rejected
+2. **Build on success**: Prioritize patterns that worked well in the past
+3. **Learn from failures**: Avoid approaches that previously caused issues
+4. **Leverage context**: Use historical file/pattern knowledge to make better suggestions
 
 ---
 

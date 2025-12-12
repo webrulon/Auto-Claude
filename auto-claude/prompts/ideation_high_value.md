@@ -61,6 +61,9 @@ cat README.md 2>/dev/null | head -100
 cat docs/FEEDBACK.md 2>/dev/null || cat FEEDBACK.md 2>/dev/null || echo "No feedback file"
 cat docs/FEATURE_REQUESTS.md 2>/dev/null || echo "No feature requests file"
 ls -la .github/ISSUE_TEMPLATE* 2>/dev/null || echo "No issue templates"
+
+# Check for graph hints (historical insights from Graphiti)
+cat graph_hints.json 2>/dev/null || echo "No graph hints available"
 ```
 
 Understand:
@@ -69,6 +72,15 @@ Understand:
 - What features already exist?
 - What is already planned (avoid duplicates)?
 - What have users asked for?
+- What historical insights are available from previous sessions?
+
+### Graph Hints Integration
+
+If `graph_hints.json` exists and contains hints for your ideation type (`high_value_features`), use them to:
+1. **Avoid duplicates**: Don't suggest features that have already been tried or rejected
+2. **Build on success**: Prioritize feature patterns that worked well in the past
+3. **Learn from failures**: Avoid approaches that previously caused issues
+4. **Leverage context**: Use historical knowledge to make better strategic suggestions
 
 ---
 

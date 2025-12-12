@@ -11,6 +11,15 @@ You have access to:
 - Configuration files (ESLint, Prettier, tsconfig, etc.)
 - Git history (if available)
 - Memory context from previous sessions (if available)
+- Graph hints from Graphiti knowledge graph (if available)
+
+### Graph Hints Integration
+
+If `graph_hints.json` exists and contains hints for your ideation type (`code_quality`), use them to:
+1. **Avoid duplicates**: Don't suggest refactorings that have already been completed
+2. **Build on success**: Prioritize refactoring patterns that worked well in the past
+3. **Learn from failures**: Avoid refactorings that previously caused regressions
+4. **Leverage context**: Use historical code quality knowledge to identify high-impact areas
 
 ## Your Mission
 

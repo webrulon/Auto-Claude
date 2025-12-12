@@ -422,6 +422,41 @@ export interface GraphitiMemoryStatus {
   reason?: string;
 }
 
+// Graphiti Provider Types (Memory System V2)
+export type GraphitiProviderType = 'openai' | 'anthropic' | 'google' | 'groq';
+export type GraphitiEmbeddingProvider = 'openai' | 'voyage' | 'google' | 'huggingface';
+
+export interface GraphitiProviderConfig {
+  // LLM Provider
+  llmProvider: GraphitiProviderType;
+  llmModel?: string;  // Model name, uses provider default if not specified
+
+  // Embedding Provider
+  embeddingProvider: GraphitiEmbeddingProvider;
+  embeddingModel?: string;  // Embedding model, uses provider default if not specified
+
+  // Provider-specific API keys (stored securely)
+  openaiApiKey?: string;
+  anthropicApiKey?: string;
+  googleApiKey?: string;
+  groqApiKey?: string;
+  voyageApiKey?: string;
+
+  // FalkorDB connection (required for all providers)
+  falkorDbHost?: string;
+  falkorDbPort?: number;
+  falkorDbPassword?: string;
+}
+
+export interface GraphitiProviderInfo {
+  id: GraphitiProviderType;
+  name: string;
+  description: string;
+  requiresApiKey: boolean;
+  defaultModel: string;
+  supportedModels: string[];
+}
+
 export interface GraphitiMemoryState {
   initialized: boolean;
   database?: string;
@@ -636,8 +671,10 @@ export interface ProjectEnvConfig {
   githubRepo?: string; // Format: owner/repo
   githubAutoSync?: boolean; // Auto-sync issues on project load
 
-  // Graphiti Memory Integration
+  // Graphiti Memory Integration (V2 - Multi-provider support)
   graphitiEnabled: boolean;
+  graphitiProviderConfig?: GraphitiProviderConfig;  // New V2 provider configuration
+  // Legacy fields (still supported for backward compatibility)
   openaiApiKey?: string;
   // Indicates if the OpenAI key is from global settings (not project-specific)
   openaiKeyIsGlobal?: boolean;

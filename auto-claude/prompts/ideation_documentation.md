@@ -9,6 +9,15 @@ You have access to:
 - Existing documentation files (README, docs/, inline comments)
 - Code complexity and public API surface
 - Memory context from previous sessions (if available)
+- Graph hints from Graphiti knowledge graph (if available)
+
+### Graph Hints Integration
+
+If `graph_hints.json` exists and contains hints for your ideation type (`documentation_gaps`), use them to:
+1. **Avoid duplicates**: Don't suggest documentation improvements that have already been completed
+2. **Build on success**: Prioritize documentation patterns that worked well in the past
+3. **Learn from feedback**: Use historical user confusion points to identify high-impact areas
+4. **Leverage context**: Use historical knowledge to make better suggestions
 
 ## Your Mission
 

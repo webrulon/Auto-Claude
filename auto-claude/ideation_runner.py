@@ -59,6 +59,7 @@ from debug import (
     debug_warning,
     debug_section,
 )
+from graphiti_providers import get_graph_hints, is_graphiti_enabled
 
 
 # Configuration
@@ -234,6 +235,39 @@ class IdeationOrchestrator:
         except Exception as e:
             return False, str(e)
 
+    async def _get_graph_hints(self, ideation_type: str) -> list[dict]:
+        """Get graph hints for a specific ideation type from Graphiti.
+
+        This runs in parallel with ideation agents to provide historical context.
+        """
+        if not is_graphiti_enabled():
+            return []
+
+        # Create a query based on ideation type
+        query_map = {
+            "low_hanging_fruit": "quick wins and simple improvements that worked well",
+            "ui_ux_improvements": "UI and UX improvements and user interface patterns",
+            "high_value_features": "high impact features and strategic improvements",
+            "documentation_gaps": "documentation improvements and common user confusion points",
+            "security_hardening": "security vulnerabilities and hardening measures",
+            "performance_optimizations": "performance bottlenecks and optimization techniques",
+            "code_quality": "code quality improvements and refactoring patterns",
+        }
+
+        query = query_map.get(ideation_type, f"ideas for {ideation_type}")
+
+        try:
+            hints = await get_graph_hints(
+                query=query,
+                project_id=str(self.project_dir),
+                max_results=5,
+            )
+            debug_success("ideation_runner", f"Got {len(hints)} graph hints for {ideation_type}")
+            return hints
+        except Exception as e:
+            debug_warning("ideation_runner", f"Graph hints failed for {ideation_type}: {e}")
+            return []
+
     def _gather_context(self) -> dict:
         """Gather context from project for ideation."""
         context = {
@@ -311,6 +345,93 @@ class IdeationOrchestrator:
 
         return context
 
+    async def phase_graph_hints(self) -> IdeationPhaseResult:
+        """Retrieve graph hints for all enabled ideation types in parallel.
+
+        This phase runs concurrently with context gathering to fetch
+        historical insights from Graphiti without slowing down the pipeline.
+        """
+        hints_file = self.output_dir / "graph_hints.json"
+
+        if hints_file.exists():
+            print_status("graph_hints.json already exists", "success")
+            return IdeationPhaseResult(
+                phase="graph_hints",
+                ideation_type=None,
+                success=True,
+                output_files=[str(hints_file)],
+                ideas_count=0,
+                errors=[],
+                retries=0,
+            )
+
+        if not is_graphiti_enabled():
+            print_status("Graphiti not enabled, skipping graph hints", "info")
+            with open(hints_file, "w") as f:
+                json.dump({
+                    "enabled": False,
+                    "reason": "Graphiti not configured",
+                    "hints_by_type": {},
+                    "created_at": datetime.now().isoformat(),
+                }, f, indent=2)
+            return IdeationPhaseResult(
+                phase="graph_hints",
+                ideation_type=None,
+                success=True,
+                output_files=[str(hints_file)],
+                ideas_count=0,
+                errors=[],
+                retries=0,
+            )
+
+        print_status("Querying Graphiti for ideation hints...", "progress")
+
+        # Fetch hints for all enabled types in parallel
+        hint_tasks = [
+            self._get_graph_hints(ideation_type)
+            for ideation_type in self.enabled_types
+        ]
+
+        results = await asyncio.gather(*hint_tasks, return_exceptions=True)
+
+        # Collect hints by type
+        hints_by_type = {}
+        total_hints = 0
+        errors = []
+
+        for i, result in enumerate(results):
+            ideation_type = self.enabled_types[i]
+            if isinstance(result, Exception):
+                errors.append(f"{ideation_type}: {str(result)}")
+                hints_by_type[ideation_type] = []
+            else:
+                hints_by_type[ideation_type] = result
+                total_hints += len(result)
+
+        # Save hints
+        with open(hints_file, "w") as f:
+            json.dump({
+                "enabled": True,
+                "hints_by_type": hints_by_type,
+                "total_hints": total_hints,
+                "created_at": datetime.now().isoformat(),
+            }, f, indent=2)
+
+        if total_hints > 0:
+            print_status(f"Retrieved {total_hints} graph hints across {len(self.enabled_types)} types", "success")
+        else:
+            print_status("No relevant graph hints found", "info")
+
+        return IdeationPhaseResult(
+            phase="graph_hints",
+            ideation_type=None,
+            success=True,
+            output_files=[str(hints_file)],
+            ideas_count=0,
+            errors=errors,
+            retries=0,
+        )
+
     async def phase_context(self) -> IdeationPhaseResult:
         """Create ideation context file."""
 
@@ -320,12 +441,24 @@ class IdeationOrchestrator:
 
         context = self._gather_context()
 
+        # Check for graph hints and include them
+        hints_file = self.output_dir / "graph_hints.json"
+        graph_hints = {}
+        if hints_file.exists():
+            try:
+                with open(hints_file) as f:
+                    hints_data = json.load(f)
+                    graph_hints = hints_data.get("hints_by_type", {})
+            except (json.JSONDecodeError, IOError):
+                pass
+
         # Write context file
         context_data = {
             "existing_features": context["existing_features"],
             "tech_stack": context["tech_stack"],
             "target_audience": context["target_audience"],
             "planned_features": context["planned_features"],
+            "graph_hints": graph_hints,  # Include graph hints in context
             "config": {
                 "enabled_types": self.enabled_types,
                 "include_roadmap_context": self.include_roadmap_context,
@@ -342,6 +475,9 @@ class IdeationOrchestrator:
         print_key_value("Tech Stack", ", ".join(context["tech_stack"][:5]) or "Unknown")
         print_key_value("Planned Features", str(len(context["planned_features"])))
         print_key_value("Target Audience", context["target_audience"] or "Not specified")
+        if graph_hints:
+            total_hints = sum(len(h) for h in graph_hints.values())
+            print_key_value("Graph Hints", str(total_hints))
 
         return IdeationPhaseResult(
             phase="context",
@@ -803,13 +939,21 @@ Write the fixed JSON to the file now.
             print_status("Project analysis failed", "error")
             return False
 
-        # Phase 2: Context Gathering
-        print_section("PHASE 2: CONTEXT GATHERING", Icons.SEARCH)
-        result = await self.phase_context()
-        results.append(result)
-        if not result.success:
+        # Phase 2: Context & Graph Hints (in parallel)
+        print_section("PHASE 2: CONTEXT & GRAPH HINTS (PARALLEL)", Icons.SEARCH)
+
+        # Run context gathering and graph hints in parallel
+        context_task = self.phase_context()
+        hints_task = self.phase_graph_hints()
+        context_result, hints_result = await asyncio.gather(context_task, hints_task)
+
+        results.append(hints_result)
+        results.append(context_result)
+
+        if not context_result.success:
             print_status("Context gathering failed", "error")
             return False
+        # Note: hints_result.success is always True (graceful degradation)
 
         # Phase 3: Run all ideation types IN PARALLEL
         debug("ideation_runner", "Starting Phase 3: Generating Ideas",

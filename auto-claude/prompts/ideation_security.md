@@ -10,6 +10,15 @@ You have access to:
 - Package manifest (package.json, requirements.txt, etc.)
 - Configuration files
 - Memory context from previous sessions (if available)
+- Graph hints from Graphiti knowledge graph (if available)
+
+### Graph Hints Integration
+
+If `graph_hints.json` exists and contains hints for your ideation type (`security_hardening`), use them to:
+1. **Avoid duplicates**: Don't suggest security fixes that have already been addressed
+2. **Build on success**: Prioritize security patterns that worked well in the past
+3. **Learn from incidents**: Use historical vulnerability knowledge to identify high-risk areas
+4. **Leverage context**: Use historical security audits to make better suggestions
 
 ## Your Mission
 

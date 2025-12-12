@@ -48,6 +48,7 @@ from ui import (
     print_key_value,
     print_section,
 )
+from graphiti_providers import get_graph_hints, is_graphiti_enabled
 
 
 # Configuration
@@ -170,6 +171,63 @@ class RoadmapOrchestrator:
 
         except Exception as e:
             return False, str(e)
+
+    async def phase_graph_hints(self) -> RoadmapPhaseResult:
+        """Retrieve graph hints for roadmap generation from Graphiti (if enabled).
+
+        This is a lightweight integration - hints are optional and cached.
+        """
+        hints_file = self.output_dir / "graph_hints.json"
+
+        if hints_file.exists() and not self.refresh:
+            print_status("graph_hints.json already exists", "success")
+            return RoadmapPhaseResult("graph_hints", True, [str(hints_file)], [], 0)
+
+        if not is_graphiti_enabled():
+            print_status("Graphiti not enabled, skipping graph hints", "info")
+            with open(hints_file, "w") as f:
+                json.dump({
+                    "enabled": False,
+                    "reason": "Graphiti not configured",
+                    "hints": [],
+                    "created_at": datetime.now().isoformat(),
+                }, f, indent=2)
+            return RoadmapPhaseResult("graph_hints", True, [str(hints_file)], [], 0)
+
+        print_status("Querying Graphiti for roadmap insights...", "progress")
+
+        try:
+            hints = await get_graph_hints(
+                query="product roadmap features priorities and strategic direction",
+                project_id=str(self.project_dir),
+                max_results=10,
+            )
+
+            with open(hints_file, "w") as f:
+                json.dump({
+                    "enabled": True,
+                    "hints": hints,
+                    "hint_count": len(hints),
+                    "created_at": datetime.now().isoformat(),
+                }, f, indent=2)
+
+            if hints:
+                print_status(f"Retrieved {len(hints)} graph hints", "success")
+            else:
+                print_status("No relevant graph hints found", "info")
+
+            return RoadmapPhaseResult("graph_hints", True, [str(hints_file)], [], 0)
+
+        except Exception as e:
+            print_status(f"Graph query failed: {e}", "warning")
+            with open(hints_file, "w") as f:
+                json.dump({
+                    "enabled": True,
+                    "error": str(e),
+                    "hints": [],
+                    "created_at": datetime.now().isoformat(),
+                }, f, indent=2)
+            return RoadmapPhaseResult("graph_hints", True, [str(hints_file)], [str(e)], 0)
 
     async def phase_project_index(self) -> RoadmapPhaseResult:
         """Ensure project index exists."""
@@ -326,13 +384,22 @@ Output the complete roadmap to roadmap.json.
 
         results = []
 
-        # Phase 1: Project Index
-        print_section("PHASE 1: PROJECT ANALYSIS", Icons.FOLDER)
-        result = await self.phase_project_index()
-        results.append(result)
-        if not result.success:
+        # Phase 1: Project Index & Graph Hints (in parallel)
+        print_section("PHASE 1: PROJECT ANALYSIS & GRAPH HINTS", Icons.FOLDER)
+
+        # Run project index and graph hints in parallel
+        import asyncio
+        index_task = self.phase_project_index()
+        hints_task = self.phase_graph_hints()
+        index_result, hints_result = await asyncio.gather(index_task, hints_task)
+
+        results.append(index_result)
+        results.append(hints_result)
+
+        if not index_result.success:
             print_status("Project analysis failed", "error")
             return False
+        # Note: hints_result.success is always True (graceful degradation)
 
         # Phase 2: Discovery
         print_section("PHASE 2: PROJECT DISCOVERY", Icons.SEARCH)
