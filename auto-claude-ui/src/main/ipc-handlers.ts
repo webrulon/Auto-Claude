@@ -1086,6 +1086,7 @@ export function setupIpcHandlers(
 
   /**
    * Get the worktree status for a task
+   * Per-spec architecture: Each spec has its own worktree at .worktrees/{spec-name}/
    */
   ipcMain.handle(
     IPC_CHANNELS.TASK_WORKTREE_STATUS,
@@ -1096,7 +1097,8 @@ export function setupIpcHandlers(
           return { success: false, error: 'Task not found' };
         }
 
-        const worktreePath = path.join(project.path, '.worktrees', 'auto-claude-staging');
+        // Per-spec worktree path: .worktrees/{spec-name}/
+        const worktreePath = path.join(project.path, '.worktrees', task.specId);
 
         if (!existsSync(worktreePath)) {
           return {
@@ -1193,6 +1195,7 @@ export function setupIpcHandlers(
 
   /**
    * Get the diff for a task's worktree
+   * Per-spec architecture: Each spec has its own worktree at .worktrees/{spec-name}/
    */
   ipcMain.handle(
     IPC_CHANNELS.TASK_WORKTREE_DIFF,
@@ -1203,7 +1206,8 @@ export function setupIpcHandlers(
           return { success: false, error: 'Task not found' };
         }
 
-        const worktreePath = path.join(project.path, '.worktrees', 'auto-claude-staging');
+        // Per-spec worktree path: .worktrees/{spec-name}/
+        const worktreePath = path.join(project.path, '.worktrees', task.specId);
 
         if (!existsSync(worktreePath)) {
           return { success: false, error: 'No worktree found for this task' };
@@ -1386,6 +1390,7 @@ export function setupIpcHandlers(
 
   /**
    * Discard the worktree changes
+   * Per-spec architecture: Each spec has its own worktree at .worktrees/{spec-name}/
    */
   ipcMain.handle(
     IPC_CHANNELS.TASK_WORKTREE_DISCARD,
@@ -1396,7 +1401,8 @@ export function setupIpcHandlers(
           return { success: false, error: 'Task not found' };
         }
 
-        const worktreePath = path.join(project.path, '.worktrees', 'auto-claude-staging');
+        // Per-spec worktree path: .worktrees/{spec-name}/
+        const worktreePath = path.join(project.path, '.worktrees', task.specId);
 
         if (!existsSync(worktreePath)) {
           return {
@@ -1460,6 +1466,119 @@ export function setupIpcHandlers(
         return {
           success: false,
           error: error instanceof Error ? error.message : 'Failed to discard worktree'
+        };
+      }
+    }
+  );
+
+  /**
+   * List all spec worktrees for a project
+   * Per-spec architecture: Each spec has its own worktree at .worktrees/{spec-name}/
+   */
+  ipcMain.handle(
+    IPC_CHANNELS.TASK_LIST_WORKTREES,
+    async (_, projectId: string): Promise<IPCResult<import('../shared/types').WorktreeListResult>> => {
+      try {
+        const project = projectStore.getProject(projectId);
+        if (!project) {
+          return { success: false, error: 'Project not found' };
+        }
+
+        const worktreesDir = path.join(project.path, '.worktrees');
+        const worktrees: import('../shared/types').WorktreeListItem[] = [];
+
+        if (!existsSync(worktreesDir)) {
+          return { success: true, data: { worktrees } };
+        }
+
+        const { execSync, readdirSync, statSync } = require('child_process');
+        const fs = require('fs');
+
+        // Get all directories in .worktrees
+        const entries = fs.readdirSync(worktreesDir);
+        for (const entry of entries) {
+          const entryPath = path.join(worktreesDir, entry);
+          const stat = fs.statSync(entryPath);
+
+          // Skip worker directories and non-directories
+          if (!stat.isDirectory() || entry.startsWith('worker-')) {
+            continue;
+          }
+
+          try {
+            // Get branch info
+            const branch = execSync('git rev-parse --abbrev-ref HEAD', {
+              cwd: entryPath,
+              encoding: 'utf-8'
+            }).trim();
+
+            // Get base branch
+            let baseBranch = 'main';
+            try {
+              baseBranch = execSync('git rev-parse --abbrev-ref origin/HEAD 2>/dev/null || echo main', {
+                cwd: project.path,
+                encoding: 'utf-8'
+              }).trim().replace('origin/', '');
+            } catch {
+              baseBranch = 'main';
+            }
+
+            // Get commit count
+            let commitCount = 0;
+            try {
+              const countOutput = execSync(`git rev-list --count ${baseBranch}..HEAD 2>/dev/null || echo 0`, {
+                cwd: entryPath,
+                encoding: 'utf-8'
+              }).trim();
+              commitCount = parseInt(countOutput, 10) || 0;
+            } catch {
+              commitCount = 0;
+            }
+
+            // Get diff stats
+            let filesChanged = 0;
+            let additions = 0;
+            let deletions = 0;
+
+            try {
+              const diffStat = execSync(`git diff --shortstat ${baseBranch}...HEAD 2>/dev/null || echo ""`, {
+                cwd: entryPath,
+                encoding: 'utf-8'
+              }).trim();
+
+              const filesMatch = diffStat.match(/(\d+) files? changed/);
+              const addMatch = diffStat.match(/(\d+) insertions?/);
+              const delMatch = diffStat.match(/(\d+) deletions?/);
+
+              if (filesMatch) filesChanged = parseInt(filesMatch[1], 10) || 0;
+              if (addMatch) additions = parseInt(addMatch[1], 10) || 0;
+              if (delMatch) deletions = parseInt(delMatch[1], 10) || 0;
+            } catch {
+              // Ignore diff errors
+            }
+
+            worktrees.push({
+              specName: entry,
+              path: entryPath,
+              branch,
+              baseBranch,
+              commitCount,
+              filesChanged,
+              additions,
+              deletions
+            });
+          } catch (gitError) {
+            console.error(`Error getting info for worktree ${entry}:`, gitError);
+            // Skip this worktree if we can't get git info
+          }
+        }
+
+        return { success: true, data: { worktrees } };
+      } catch (error) {
+        console.error('Failed to list worktrees:', error);
+        return {
+          success: false,
+          error: error instanceof Error ? error.message : 'Failed to list worktrees'
         };
       }
     }

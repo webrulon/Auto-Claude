@@ -150,6 +150,9 @@ const electronAPI: ElectronAPI = {
   discardWorktree: (taskId: string): Promise<IPCResult<import('../shared/types').WorktreeDiscardResult>> =>
     ipcRenderer.invoke(IPC_CHANNELS.TASK_WORKTREE_DISCARD, taskId),
 
+  listWorktrees: (projectId: string): Promise<IPCResult<import('../shared/types').WorktreeListResult>> =>
+    ipcRenderer.invoke(IPC_CHANNELS.TASK_LIST_WORKTREES, projectId),
+
   // ============================================
   // Event Listeners (main → renderer)
   // ============================================

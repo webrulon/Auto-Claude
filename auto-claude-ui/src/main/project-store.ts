@@ -201,6 +201,11 @@ export class ProjectStore {
           }
         }
 
+        // Fallback: read description from implementation_plan.json if not found in spec.md
+        if (!description && plan?.description) {
+          description = plan.description;
+        }
+
         // Try to read task metadata
         const metadataPath = path.join(specPath, 'task_metadata.json');
         let metadata: TaskMetadata | undefined;

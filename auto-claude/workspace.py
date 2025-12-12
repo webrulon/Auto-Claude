@@ -1,16 +1,17 @@
 #!/usr/bin/env python3
 """
-Workspace Selection and Management
-===================================
+Workspace Management - Per-Spec Architecture
+=============================================
 
-Provides a user-friendly interface for choosing where auto-claude should work.
-Designed for "vibe coders" - people who may not understand git internals.
+Handles workspace isolation through Git worktrees, where each spec
+gets its own isolated worktree in .worktrees/{spec-name}/.
 
-Key principles:
-1. Simple language - no git jargon
-2. Safe defaults - protect user's work
-3. Clear outcomes - explain what will happen
-4. No dangerous options - discard requires separate deliberate action
+Key changes from old design:
+- Each spec has its own worktree (not shared)
+- Worktree path: .worktrees/{spec-name}/
+- Branch name: auto-claude/{spec-name}
+- Fixed: get_existing_build_worktree() now properly checks spec_name
+- Fixed: finalize_workspace() skips prompts in auto_continue mode
 
 Terminology mapping (technical -> user-friendly):
 - worktree -> "separate workspace"
@@ -18,8 +19,6 @@ Terminology mapping (technical -> user-friendly):
 - uncommitted changes -> "unsaved work"
 - merge -> "add to your project"
 - working directory -> "your project"
-
-Enhanced with icons, colors, and interactive menus.
 """
 
 import shutil
@@ -29,7 +28,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Optional
 
-from worktree import WorktreeManager, WorktreeInfo, STAGING_WORKTREE_NAME
+from worktree import WorktreeManager, WorktreeInfo
 from ui import (
     Icons,
     icon,
@@ -86,8 +85,18 @@ def get_current_branch(project_dir: Path) -> str:
 
 
 def get_existing_build_worktree(project_dir: Path, spec_name: str) -> Optional[Path]:
-    """Check if there's an existing staging worktree."""
-    worktree_path = project_dir / ".worktrees" / STAGING_WORKTREE_NAME
+    """
+    Check if there's an existing worktree for this specific spec.
+
+    Args:
+        project_dir: The main project directory
+        spec_name: The spec folder name (e.g., "001-feature-name")
+
+    Returns:
+        Path to the worktree if it exists for this spec, None otherwise
+    """
+    # Per-spec worktree path: .worktrees/{spec-name}/
+    worktree_path = project_dir / ".worktrees" / spec_name
     if worktree_path.exists():
         return worktree_path
     return None
@@ -235,12 +244,11 @@ def setup_workspace(
     """
     Set up the workspace based on user's choice.
 
-    Uses the staging worktree pattern - all work happens in one worktree
-    that the user can test before merging.
+    Uses per-spec worktrees - each spec gets its own isolated worktree.
 
     Args:
         project_dir: The project directory
-        spec_name: Name of the spec being built
+        spec_name: Name of the spec being built (e.g., "001-feature-name")
         mode: The workspace mode to use
         source_spec_dir: Optional source spec directory to copy to worktree
 
@@ -256,34 +264,34 @@ def setup_workspace(
         # Work directly in project - spec_dir stays as-is
         return project_dir, None, source_spec_dir
 
-    # Create isolated workspace using staging worktree
+    # Create isolated workspace using per-spec worktree
     print()
     print_status("Setting up separate workspace...", "progress")
 
     manager = WorktreeManager(project_dir)
     manager.setup()
 
-    # Get or create the staging worktree
-    info = manager.get_or_create_staging(spec_name)
+    # Get or create worktree for THIS SPECIFIC SPEC
+    worktree_info = manager.get_or_create_worktree(spec_name)
 
     # Copy spec files to worktree if provided
     localized_spec_dir = None
     if source_spec_dir and source_spec_dir.exists():
         localized_spec_dir = copy_spec_to_worktree(
-            source_spec_dir, info.path, spec_name
+            source_spec_dir, worktree_info.path, spec_name
         )
         print_status(f"Spec files copied to workspace", "success")
 
-    print_status(f"Workspace ready: {info.path.name}", "success")
+    print_status(f"Workspace ready: {worktree_info.path.name}", "success")
     print()
 
-    return info.path, manager, localized_spec_dir
+    return worktree_info.path, manager, localized_spec_dir
 
 
-def show_build_summary(manager: WorktreeManager, name: str = STAGING_WORKTREE_NAME) -> None:
+def show_build_summary(manager: WorktreeManager, spec_name: str) -> None:
     """Show a summary of what was built."""
-    summary = manager.get_change_summary(name)
-    files = manager.get_changed_files(name)
+    summary = manager.get_change_summary(spec_name)
+    files = manager.get_changed_files(spec_name)
 
     total = summary["new_files"] + summary["modified_files"] + summary["deleted_files"]
 
@@ -301,9 +309,9 @@ def show_build_summary(manager: WorktreeManager, name: str = STAGING_WORKTREE_NA
         print(error(f"  - {summary['deleted_files']} deleted file{'s' if summary['deleted_files'] != 1 else ''}"))
 
 
-def show_changed_files(manager: WorktreeManager, name: str = STAGING_WORKTREE_NAME) -> None:
+def show_changed_files(manager: WorktreeManager, spec_name: str) -> None:
     """Show detailed list of changed files."""
-    files = manager.get_changed_files(name)
+    files = manager.get_changed_files(spec_name)
 
     if not files:
         print_status("No changes.", "info")
@@ -326,6 +334,7 @@ def finalize_workspace(
     project_dir: Path,
     spec_name: str,
     manager: Optional[WorktreeManager],
+    auto_continue: bool = False,
 ) -> WorkspaceChoice:
     """
     Handle post-build workflow - let user decide what to do with changes.
@@ -339,6 +348,7 @@ def finalize_workspace(
         project_dir: The project directory
         spec_name: Name of the spec that was built
         manager: The worktree manager (None if direct mode was used)
+        auto_continue: If True, skip interactive prompts (UI mode)
 
     Returns:
         WorkspaceChoice indicating what user wants to do
@@ -355,6 +365,16 @@ def finalize_workspace(
         print(box(content, width=60, style="heavy"))
         return WorkspaceChoice.MERGE  # Already merged
 
+    # In auto_continue mode (UI), skip interactive prompts
+    # The worktree stays for the UI to manage
+    if auto_continue:
+        worktree_info = manager.get_worktree_info(spec_name)
+        if worktree_info:
+            print()
+            print(success(f"Build complete in worktree: {worktree_info.path}"))
+            print(muted("Worktree preserved for UI review."))
+        return WorkspaceChoice.LATER
+
     # Isolated mode - show options with testing as the recommended path
     content = [
         success(f"{icon(Icons.SUCCESS)} BUILD COMPLETE!"),
@@ -364,10 +384,11 @@ def finalize_workspace(
     print()
     print(box(content, width=60, style="heavy"))
 
-    show_build_summary(manager)
+    show_build_summary(manager, spec_name)
 
-    # Get the staging path for test instructions
-    staging_path = manager.get_staging_path()
+    # Get the worktree path for test instructions
+    worktree_info = manager.get_worktree_info(spec_name)
+    staging_path = worktree_info.path if worktree_info else None
 
     # Enhanced menu for post-build options
     options = [
@@ -429,7 +450,8 @@ def handle_workspace_choice(
         spec_name: Name of the spec
         manager: The worktree manager
     """
-    staging_path = manager.get_staging_path()
+    worktree_info = manager.get_worktree_info(spec_name)
+    staging_path = worktree_info.path if worktree_info else None
 
     if choice == WorkspaceChoice.TEST:
         # Show testing instructions
@@ -447,11 +469,11 @@ def handle_workspace_choice(
         if staging_path:
             print(highlight(f"  cd {staging_path}"))
         else:
-            print(highlight(f"  cd {project_dir}/.worktrees/{STAGING_WORKTREE_NAME}"))
+            print(highlight(f"  cd {project_dir}/.worktrees/{spec_name}"))
 
         # Show likely test/run commands
         if staging_path:
-            commands = manager.get_test_commands(staging_path)
+            commands = manager.get_test_commands(spec_name)
             print()
             print("Then run your project:")
             for cmd in commands[:2]:  # Show top 2 commands
@@ -470,7 +492,7 @@ def handle_workspace_choice(
     elif choice == WorkspaceChoice.MERGE:
         print()
         print_status("Adding changes to your project...", "progress")
-        success_result = manager.merge_staging(delete_after=True)
+        success_result = manager.merge_worktree(spec_name, delete_after=True)
 
         if success_result:
             print()
@@ -482,14 +504,13 @@ def handle_workspace_choice(
             print(muted("You may need to merge manually or ask for help."))
 
     elif choice == WorkspaceChoice.REVIEW:
-        show_changed_files(manager)
+        show_changed_files(manager, spec_name)
         print()
         print(muted("-" * 60))
         print()
         print("To see full details of changes:")
-        info_obj = manager.get_staging_info()
-        if info_obj:
-            print(muted(f"  git diff {info_obj.base_branch}...{info_obj.branch}"))
+        if worktree_info:
+            print(muted(f"  git diff {worktree_info.base_branch}...{worktree_info.branch}"))
         print()
         print("To test the feature:")
         if staging_path:
@@ -507,7 +528,7 @@ def handle_workspace_choice(
         if staging_path:
             print(highlight(f"  cd {staging_path}"))
         else:
-            print(highlight(f"  cd {project_dir}/.worktrees/{STAGING_WORKTREE_NAME}"))
+            print(highlight(f"  cd {project_dir}/.worktrees/{spec_name}"))
         print()
         print("When you're ready to add it:")
         print(highlight(f"  python auto-claude/run.py --spec {spec_name} --merge"))
@@ -547,13 +568,11 @@ def merge_existing_build(project_dir: Path, spec_name: str) -> bool:
     print(box(content, width=60, style="heavy"))
 
     manager = WorktreeManager(project_dir)
-    # Load the staging worktree info
-    manager.get_staging_info()
 
-    show_build_summary(manager)
+    show_build_summary(manager, spec_name)
     print()
 
-    success_result = manager.merge_staging(delete_after=True)
+    success_result = manager.merge_worktree(spec_name, delete_after=True)
 
     if success_result:
         print()
@@ -596,11 +615,10 @@ def review_existing_build(project_dir: Path, spec_name: str) -> bool:
     print(box(content, width=60, style="heavy"))
 
     manager = WorktreeManager(project_dir)
-    # Load the staging worktree info
-    info_obj = manager.get_staging_info()
+    worktree_info = manager.get_worktree_info(spec_name)
 
-    show_build_summary(manager)
-    show_changed_files(manager)
+    show_build_summary(manager, spec_name)
+    show_changed_files(manager, spec_name)
 
     print()
     print(muted("-" * 60))
@@ -612,8 +630,8 @@ def review_existing_build(project_dir: Path, spec_name: str) -> bool:
     print(highlight(f"  python auto-claude/run.py --spec {spec_name} --merge"))
     print()
     print("To see full diff:")
-    if info_obj:
-        print(muted(f"  git diff {info_obj.base_branch}...{info_obj.branch}"))
+    if worktree_info:
+        print(muted(f"  git diff {worktree_info.base_branch}...{worktree_info.branch}"))
     print()
 
     return True
@@ -650,10 +668,8 @@ def discard_existing_build(project_dir: Path, spec_name: str) -> bool:
     print(box(content, width=60, style="heavy"))
 
     manager = WorktreeManager(project_dir)
-    # Load the staging worktree info
-    manager.get_staging_info()
 
-    show_build_summary(manager)
+    show_build_summary(manager, spec_name)
 
     print()
     print(f"Are you sure? Type {highlight('delete')} to confirm: ", end="")
@@ -671,7 +687,7 @@ def discard_existing_build(project_dir: Path, spec_name: str) -> bool:
         return False
 
     # Actually delete
-    manager.remove_staging(delete_branch=True)
+    manager.remove_worktree(spec_name, delete_branch=True)
 
     print()
     print_status("Build deleted.", "success")
@@ -752,3 +768,65 @@ def check_existing_build(project_dir: Path, spec_name: str) -> bool:
         return not discarded  # If discarded, start fresh
     else:
         return True  # Default to continue
+
+
+def list_all_worktrees(project_dir: Path) -> list[WorktreeInfo]:
+    """
+    List all spec worktrees in the project.
+
+    Args:
+        project_dir: Main project directory
+
+    Returns:
+        List of WorktreeInfo for each spec worktree
+    """
+    manager = WorktreeManager(project_dir)
+    return manager.list_all_worktrees()
+
+
+def cleanup_all_worktrees(project_dir: Path, confirm: bool = True) -> bool:
+    """
+    Remove all worktrees and their branches.
+
+    Args:
+        project_dir: Main project directory
+        confirm: Whether to ask for confirmation
+
+    Returns:
+        True if cleanup succeeded
+    """
+    manager = WorktreeManager(project_dir)
+    worktrees = manager.list_all_worktrees()
+
+    if not worktrees:
+        print_status("No worktrees found.", "info")
+        return True
+
+    print()
+    print("=" * 70)
+    print("  CLEANUP ALL WORKTREES")
+    print("=" * 70)
+
+    content = [
+        warning(f"{icon(Icons.WARNING)} THIS WILL DELETE ALL BUILD WORKTREES"),
+        "",
+        "The following will be removed:",
+    ]
+    for wt in worktrees:
+        content.append(f"  - {wt.spec_name} ({wt.branch})")
+
+    print()
+    print(box(content, width=70, style="heavy"))
+
+    if confirm:
+        print()
+        response = input("  Type 'cleanup' to confirm: ").strip()
+        if response != 'cleanup':
+            print_status("Cleanup cancelled.", "info")
+            return False
+
+    manager.cleanup_all()
+
+    print()
+    print_status("All worktrees cleaned up.", "success")
+    return True

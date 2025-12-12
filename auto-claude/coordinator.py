@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
 """
-Multi-Agent Parallelism Coordinator with Staging Worktree
-==========================================================
+Multi-Agent Parallelism Coordinator - Per-Spec Architecture
+============================================================
 
 Implements a swarm coordination pattern for parallel execution of independent chunks.
-All work is collected in a single STAGING worktree that the user can test before merging.
+Each spec gets its own worktree in .worktrees/{spec-name}/.
 
 Architecture:
-1. Create ONE staging worktree: .worktrees/auto-claude/
-2. Each worker gets a temporary worktree for isolation during work
-3. Workers merge INTO staging (not base branch)
-4. User can cd into staging, run the app, test the feature
+1. Create per-spec worktree: .worktrees/{spec-name}/
+2. Each worker gets a temporary worktree: .worktrees/worker-{id}/
+3. Workers merge INTO the spec's worktree (not base branch)
+4. User can cd into spec worktree, run the app, test the feature
 5. Only merges to user's project when they explicitly approve
 
 Benefits:
@@ -18,6 +18,7 @@ Benefits:
 - All work is collected in one place for review
 - No partial merges - it's all or nothing
 - Easy to discard if the feature doesn't work
+- Multiple specs can be worked on simultaneously (per-spec isolation)
 
 Prerequisites:
 - Git 2.5+ (for worktree support)
@@ -36,7 +37,7 @@ from pathlib import Path
 from typing import Optional
 
 from implementation_plan import ImplementationPlan, Phase, Chunk, ChunkStatus
-from worktree import WorktreeManager, STAGING_WORKTREE_NAME
+from worktree import WorktreeManager
 from ui import (
     Icons,
     icon,
@@ -349,25 +350,26 @@ class SwarmCoordinator:
 
         return True
 
-    async def merge_worker_to_staging(self, worker_id: str, branch_name: str, worktree_path: Path) -> bool:
+    async def merge_worker_to_spec(self, worker_id: str, branch_name: str, worktree_path: Path) -> bool:
         """
-        Merge a worker's completed work into the staging worktree.
+        Merge a worker's completed work into the spec's worktree.
 
         Uses a lock to serialize merges.
         """
         async with self._merge_lock:
-            staging_path = self.worktree_manager.get_staging_path()
-            if not staging_path:
-                print(f"Worker {worker_id}: No staging worktree found!")
+            spec_name = self._get_spec_name()
+            spec_path = self.worktree_manager.get_worktree_path(spec_name)
+            if not spec_path.exists():
+                print(f"Worker {worker_id}: No spec worktree found for {spec_name}!")
                 return False
 
-            print(f"Worker {worker_id}: Merging into staging...")
+            print(f"Worker {worker_id}: Merging into spec worktree...")
 
-            # Merge the worker branch into staging
+            # Merge the worker branch into spec worktree
             result = subprocess.run(
                 ["git", "merge", "--no-ff", branch_name,
                  "-m", f"auto-claude: Merge {branch_name}"],
-                cwd=staging_path,
+                cwd=spec_path,
                 capture_output=True,
                 text=True,
             )
@@ -376,12 +378,12 @@ class SwarmCoordinator:
                 print(f"  Merge conflict! Aborting merge...")
                 subprocess.run(
                     ["git", "merge", "--abort"],
-                    cwd=staging_path,
+                    cwd=spec_path,
                     capture_output=True,
                 )
                 return False
 
-            print(f"  Successfully merged {branch_name} into staging")
+            print(f"  Successfully merged {branch_name} into spec worktree")
             return True
 
     async def run_worker(
@@ -409,43 +411,19 @@ class SwarmCoordinator:
         active_workers = len([w for w in self.workers.values() if w.status == WorkerStatus.WORKING])
         self.status_manager.update_workers(active_workers + 1, self.max_workers)
 
-        # Get staging info to branch from
-        staging_info = self.worktree_manager.get_staging_info()
-        if not staging_info:
-            print(f"Worker {worker_id}: No staging worktree!")
+        # Get spec worktree info to branch from
+        spec_name = self._get_spec_name()
+        spec_info = self.worktree_manager.get_worktree_info(spec_name)
+        if not spec_info:
+            print(f"Worker {worker_id}: No spec worktree for {spec_name}!")
             return False
 
-        # Create temporary worktree for this worker (branching from staging)
-        worker_name = f"worker-{worker_id}"
-        branch_name = f"worker-{worker_id}/{chunk.id}"
-        worktree_path = self.worktree_manager.worktrees_dir / worker_name
-
+        # Create temporary worktree for this worker (branching from spec's worktree)
         try:
-            # Create worktree branching from staging branch
-            subprocess.run(
-                ["git", "worktree", "remove", "--force", str(worktree_path)],
-                cwd=self.project_dir,
-                capture_output=True,
+            worktree_path, branch_name = self.worktree_manager.create_worker_worktree(
+                spec_name, worker_id, chunk.id
             )
-            subprocess.run(
-                ["git", "branch", "-D", branch_name],
-                cwd=self.project_dir,
-                capture_output=True,
-            )
-
-            result = subprocess.run(
-                ["git", "worktree", "add", "-b", branch_name,
-                 str(worktree_path), staging_info.branch],
-                cwd=self.project_dir,
-                capture_output=True,
-                text=True,
-            )
-
-            if result.returncode != 0:
-                print(f"Worker {worker_id}: Failed to create worktree: {result.stderr}")
-                return False
-
-            print_status(f"Created worker worktree: {worktree_path.name} (from staging)", "success")
+            print_status(f"Created worker worktree: {worktree_path.name} (from {spec_info.branch})", "success")
 
         except Exception as e:
             print_status(f"Worker {worker_id}: Failed to create worktree: {e}", "error")
@@ -525,13 +503,13 @@ class SwarmCoordinator:
             active_workers = len([w for w in self.workers.values() if w.status == WorkerStatus.WORKING])
             self.status_manager.update_workers(active_workers, self.max_workers)
 
-            # Merge to staging if successful
+            # Merge to spec worktree if successful
             if chunk_success:
-                merge_success = await self.merge_worker_to_staging(
+                merge_success = await self.merge_worker_to_spec(
                     worker_id, branch_name, worktree_path
                 )
                 if not merge_success:
-                    print_status(f"Worker {worker_id}: Merge to staging failed for {chunk.id}", "error")
+                    print_status(f"Worker {worker_id}: Merge to spec worktree failed for {chunk.id}", "error")
                     # Mark chunk as failed due to merge conflict
                     for p in self.plan.phases:
                         for c in p.chunks:
@@ -604,7 +582,7 @@ class SwarmCoordinator:
         """
         Main coordination loop.
 
-        Returns the path to the staging worktree where all work is collected.
+        Returns the path to the spec's worktree where all work is collected.
         """
         # Check if implementation plan exists, run planner if not
         plan_file = self.spec_dir / "implementation_plan.json"
@@ -618,7 +596,7 @@ class SwarmCoordinator:
             bold(f"{icon(Icons.LIGHTNING)} PARALLEL EXECUTION MODE"),
             "",
             f"Max Workers: {highlight(str(self.max_workers))}",
-            muted("All work collected in staging worktree for testing"),
+            muted("All work collected in spec worktree for testing"),
         ]
         print()
         print(box(content, width=70, style="heavy"))
@@ -639,11 +617,11 @@ class SwarmCoordinator:
         self.worktree_manager = WorktreeManager(self.project_dir, base_branch)
         self.worktree_manager.setup()
 
-        # Create or get the staging worktree
+        # Create or get the per-spec worktree
         spec_name = self._get_spec_name()
-        staging_info = self.worktree_manager.get_or_create_staging(spec_name)
-        print_key_value("Staging worktree", str(staging_info.path))
-        print_key_value("Staging branch", staging_info.branch)
+        spec_info = self.worktree_manager.get_or_create_worktree(spec_name)
+        print_key_value("Spec worktree", str(spec_info.path))
+        print_key_value("Spec branch", spec_info.branch)
         print()
 
         # Update status with initial chunk counts
@@ -716,9 +694,9 @@ class SwarmCoordinator:
                     await asyncio.sleep(1)
 
         finally:
-            # Clean up only worker worktrees, preserve staging
+            # Clean up only worker worktrees, preserve spec worktree
             print_status("Cleaning up worker worktrees...", "info")
-            self.worktree_manager.cleanup_workers_only()
+            self.worktree_manager.cleanup_all_workers()
 
         # Print final summary
         progress = self.plan.get_progress()
@@ -735,16 +713,16 @@ class SwarmCoordinator:
         # Update status to complete
         self.status_manager.update(state=BuildState.COMPLETE)
 
-        # Show staging info
-        staging_path = self.worktree_manager.get_staging_path()
-        if staging_path:
-            summary = self.worktree_manager.get_change_summary()
-            test_commands = self.worktree_manager.get_test_commands(staging_path)
+        # Show spec worktree info
+        spec_path = self.worktree_manager.get_worktree_path(spec_name)
+        if spec_path.exists():
+            summary = self.worktree_manager.get_change_summary(spec_name)
+            test_commands = self.worktree_manager.get_test_commands(spec_name)
 
             content = [
                 bold(f"{icon(Icons.PLAY)} YOUR FEATURE IS READY TO TEST"),
                 "",
-                f"All work collected in: {highlight(str(staging_path))}",
+                f"All work collected in: {highlight(str(spec_path))}",
             ]
             print()
             print(box(content, width=70, style="light"))
@@ -761,7 +739,7 @@ class SwarmCoordinator:
 
             print()
             print("To test it:")
-            print(highlight(f"  cd {staging_path}"))
+            print(highlight(f"  cd {spec_path}"))
             for cmd in test_commands[:2]:  # Show first 2 commands
                 print(f"  {cmd}")
             print()
@@ -774,4 +752,4 @@ class SwarmCoordinator:
             print(muted(f"  python auto-claude/run.py --spec {spec_name} --review"))
             print()
 
-        return staging_path
+        return spec_path

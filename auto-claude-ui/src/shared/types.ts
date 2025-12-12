@@ -227,6 +227,28 @@ export interface WorktreeDiscardResult {
   message: string;
 }
 
+/**
+ * Information about a single spec worktree
+ * Per-spec architecture: Each spec has its own worktree at .worktrees/{spec-name}/
+ */
+export interface WorktreeListItem {
+  specName: string;
+  path: string;
+  branch: string;
+  baseBranch: string;
+  commitCount: number;
+  filesChanged: number;
+  additions: number;
+  deletions: number;
+}
+
+/**
+ * Result of listing all spec worktrees
+ */
+export interface WorktreeListResult {
+  worktrees: WorktreeListItem[];
+}
+
 // Stuck task recovery types
 export interface StuckTaskInfo {
   taskId: string;
@@ -1036,10 +1058,12 @@ export interface ElectronAPI {
   checkTaskRunning: (taskId: string) => Promise<IPCResult<boolean>>;
 
   // Workspace management (for human review)
+  // Per-spec architecture: Each spec has its own worktree at .worktrees/{spec-name}/
   getWorktreeStatus: (taskId: string) => Promise<IPCResult<WorktreeStatus>>;
   getWorktreeDiff: (taskId: string) => Promise<IPCResult<WorktreeDiff>>;
   mergeWorktree: (taskId: string) => Promise<IPCResult<WorktreeMergeResult>>;
   discardWorktree: (taskId: string) => Promise<IPCResult<WorktreeDiscardResult>>;
+  listWorktrees: (projectId: string) => Promise<IPCResult<WorktreeListResult>>;
 
   // Event listeners
   onTaskProgress: (callback: (taskId: string, plan: ImplementationPlan) => void) => () => void;

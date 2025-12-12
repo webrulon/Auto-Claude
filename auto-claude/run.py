@@ -85,8 +85,10 @@ from workspace import (
     discard_existing_build,
     check_existing_build,
     get_existing_build_worktree,
+    list_all_worktrees,
+    cleanup_all_worktrees,
 )
-from worktree import WorktreeManager, STAGING_WORKTREE_NAME
+from worktree import WorktreeManager
 from debug import (
     debug,
     debug_detailed,
@@ -415,6 +417,18 @@ Environment Variables:
         help="Non-interactive mode: auto-continue existing builds, skip prompts (for UI integration)",
     )
 
+    # Worktree management
+    parser.add_argument(
+        "--list-worktrees",
+        action="store_true",
+        help="List all spec worktrees and their status",
+    )
+    parser.add_argument(
+        "--cleanup-worktrees",
+        action="store_true",
+        help="Remove all spec worktrees and their branches (with confirmation)",
+    )
+
     return parser.parse_args()
 
 
@@ -512,6 +526,43 @@ def main() -> None:
     if args.list:
         print_banner()
         print_specs_list(project_dir, args.dev)
+        return
+
+    # Handle --list-worktrees
+    if args.list_worktrees:
+        print_banner()
+        print("\n" + "=" * 70)
+        print("  SPEC WORKTREES")
+        print("=" * 70)
+        print()
+
+        worktrees = list_all_worktrees(project_dir)
+        if not worktrees:
+            print("  No worktrees found.")
+            print()
+            print("  Worktrees are created when you run a build in isolated mode.")
+        else:
+            for wt in worktrees:
+                print(f"  {icon(Icons.FOLDER)} {wt.spec_name}")
+                print(f"       Branch: {wt.branch}")
+                print(f"       Path: {wt.path}")
+                print(f"       Commits: {wt.commit_count}, Files: {wt.files_changed}")
+                print()
+
+            print("-" * 70)
+            print()
+            print("  To merge:   python auto-claude/run.py --spec <name> --merge")
+            print("  To review:  python auto-claude/run.py --spec <name> --review")
+            print("  To discard: python auto-claude/run.py --spec <name> --discard")
+            print()
+            print("  To cleanup all worktrees: python auto-claude/run.py --cleanup-worktrees")
+        print()
+        return
+
+    # Handle --cleanup-worktrees
+    if args.cleanup_worktrees:
+        print_banner()
+        cleanup_all_worktrees(project_dir, confirm=True)
         return
 
     # Require --spec if not listing
@@ -667,7 +718,7 @@ def main() -> None:
 
     try:
         if args.parallel > 1:
-            # Parallel mode with multiple workers (uses staging worktree)
+            # Parallel mode with multiple workers (uses per-spec worktree)
             debug("run.py", "Initializing parallel coordinator", workers=args.parallel)
             coordinator = SwarmCoordinator(
                 spec_dir=spec_dir,
@@ -680,12 +731,12 @@ def main() -> None:
             asyncio.run(coordinator.run_parallel())
             debug_success("run.py", "Parallel execution completed")
 
-            # After parallel completion, show staging worktree info
-            staging_manager = WorktreeManager(project_dir)
-            staging_info = staging_manager.get_staging_info()
-            if staging_info:
-                choice = finalize_workspace(project_dir, spec_dir.name, staging_manager)
-                handle_workspace_choice(choice, project_dir, spec_dir.name, staging_manager)
+            # After parallel completion, show per-spec worktree info
+            spec_manager = WorktreeManager(project_dir)
+            spec_info = spec_manager.get_worktree_info(spec_dir.name)
+            if spec_info:
+                choice = finalize_workspace(project_dir, spec_dir.name, spec_manager, auto_continue=args.auto_continue)
+                handle_workspace_choice(choice, project_dir, spec_dir.name, spec_manager)
         else:
             # Sequential mode
             debug("run.py", "Starting sequential execution")
@@ -742,7 +793,7 @@ def main() -> None:
         # Post-build finalization (only for isolated sequential mode)
         # This happens AFTER QA validation so the worktree still exists
         if worktree_manager:
-            choice = finalize_workspace(project_dir, spec_dir.name, worktree_manager)
+            choice = finalize_workspace(project_dir, spec_dir.name, worktree_manager, auto_continue=args.auto_continue)
             handle_workspace_choice(choice, project_dir, spec_dir.name, worktree_manager)
 
     except KeyboardInterrupt:

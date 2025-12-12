@@ -1,35 +1,26 @@
 #!/usr/bin/env python3
 """
-Git Worktree Manager
-====================
+Git Worktree Manager - Per-Spec Architecture
+=============================================
 
-Manages Git worktrees for isolated auto-claude execution.
+Each spec gets its own worktree:
+- Worktree path: .worktrees/{spec-name}/
+- Branch name: auto-claude/{spec-name}
 
-Architecture:
-- ONE staging worktree per spec: .worktrees/auto-claude/
-- All work (sequential or parallel) happens in this staging worktree
-- User can cd into it, run the app, test the feature
-- Only merges to their project when they're ready
-
-Worktrees allow auto-claude to work in a completely separate directory
-while sharing the same git repository. This provides:
-
-1. Safety: User's current work is never touched
-2. Isolation: Auto-claude has a clean environment
-3. Testability: User can run/test the feature before accepting
-4. Easy rollback: Just remove the worktree if unwanted
+This allows:
+1. Multiple specs to be worked on simultaneously
+2. Each spec's changes are isolated
+3. Branches persist until explicitly merged
+4. Clear 1:1:1 mapping: spec → worktree → branch
 """
 
 import asyncio
+import re
 import shutil
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
-
-
-# Standard name for the staging worktree
-STAGING_WORKTREE_NAME = "auto-claude"
 
 
 class WorktreeError(Exception):
@@ -39,35 +30,31 @@ class WorktreeError(Exception):
 
 @dataclass
 class WorktreeInfo:
-    """Information about a worktree."""
+    """Information about a spec's worktree."""
     path: Path
     branch: str
+    spec_name: str
     base_branch: str
     is_active: bool = True
+    commit_count: int = 0
+    files_changed: int = 0
+    additions: int = 0
+    deletions: int = 0
 
 
 class WorktreeManager:
     """
-    Manages Git worktrees for isolated execution.
+    Manages per-spec Git worktrees.
 
-    Each worktree is a complete copy of the project in a separate directory,
-    on its own branch. This provides complete isolation - git operations
-    in one worktree don't affect others.
+    Each spec gets its own worktree in .worktrees/{spec-name}/ with
+    a corresponding branch auto-claude/{spec-name}.
     """
 
     def __init__(self, project_dir: Path, base_branch: Optional[str] = None):
-        """
-        Initialize the worktree manager.
-
-        Args:
-            project_dir: The main project directory (must be a git repo)
-            base_branch: Branch to base worktrees on (default: current branch)
-        """
         self.project_dir = project_dir
         self.base_branch = base_branch or self._get_current_branch()
         self.worktrees_dir = project_dir / ".worktrees"
         self._merge_lock = asyncio.Lock()
-        self._active_worktrees: dict[str, WorktreeInfo] = {}
 
     def _get_current_branch(self) -> str:
         """Get the current git branch."""
@@ -91,59 +78,103 @@ class WorktreeManager:
         )
 
     def setup(self) -> None:
-        """Create worktrees directory and cleanup any stale worktrees."""
+        """Create worktrees directory if needed."""
         self.worktrees_dir.mkdir(exist_ok=True)
-        self._cleanup_stale_worktrees()
 
-    def _cleanup_stale_worktrees(self) -> None:
-        """Remove any worktrees left over from previous runs (except staging)."""
-        if not self.worktrees_dir.exists():
-            return
+    # ==================== Per-Spec Worktree Methods ====================
 
-        # Get list of registered worktrees
-        result = self._run_git(["worktree", "list", "--porcelain"])
+    def get_worktree_path(self, spec_name: str) -> Path:
+        """Get the worktree path for a spec."""
+        return self.worktrees_dir / spec_name
 
-        registered_paths = set()
-        for line in result.stdout.split("\n"):
-            if line.startswith("worktree "):
-                registered_paths.add(Path(line.split(" ", 1)[1]))
+    def get_branch_name(self, spec_name: str) -> str:
+        """Get the branch name for a spec."""
+        return f"auto-claude/{spec_name}"
 
-        # Remove directories in .worktrees that aren't registered
-        # BUT preserve the staging worktree (auto-claude)
-        for item in self.worktrees_dir.iterdir():
-            if item.is_dir():
-                # Don't auto-cleanup the staging worktree
-                if item.name == STAGING_WORKTREE_NAME:
-                    continue
+    def worktree_exists(self, spec_name: str) -> bool:
+        """Check if a worktree exists for a spec."""
+        return self.get_worktree_path(spec_name).exists()
 
-                if item not in registered_paths:
-                    print(f"  Removing stale worktree directory: {item.name}")
-                    shutil.rmtree(item, ignore_errors=True)
-                else:
-                    # Registered but stale - prune it
-                    print(f"  Pruning stale worktree: {item.name}")
-                    self._run_git(["worktree", "remove", "--force", str(item)])
+    def get_worktree_info(self, spec_name: str) -> Optional[WorktreeInfo]:
+        """Get info about a spec's worktree."""
+        worktree_path = self.get_worktree_path(spec_name)
+        if not worktree_path.exists():
+            return None
 
-        # Prune worktree list
-        self._run_git(["worktree", "prune"])
+        # Verify the branch exists in the worktree
+        result = self._run_git(["rev-parse", "--abbrev-ref", "HEAD"], cwd=worktree_path)
+        if result.returncode != 0:
+            return None
 
-    def create(self, name: str, branch_name: Optional[str] = None) -> WorktreeInfo:
+        actual_branch = result.stdout.strip()
+
+        # Get statistics
+        stats = self._get_worktree_stats(spec_name)
+
+        return WorktreeInfo(
+            path=worktree_path,
+            branch=actual_branch,
+            spec_name=spec_name,
+            base_branch=self.base_branch,
+            is_active=True,
+            **stats
+        )
+
+    def _get_worktree_stats(self, spec_name: str) -> dict:
+        """Get diff statistics for a worktree."""
+        worktree_path = self.get_worktree_path(spec_name)
+
+        stats = {
+            "commit_count": 0,
+            "files_changed": 0,
+            "additions": 0,
+            "deletions": 0,
+        }
+
+        if not worktree_path.exists():
+            return stats
+
+        # Commit count
+        result = self._run_git(
+            ["rev-list", "--count", f"{self.base_branch}..HEAD"],
+            cwd=worktree_path
+        )
+        if result.returncode == 0:
+            stats["commit_count"] = int(result.stdout.strip() or "0")
+
+        # Diff stats
+        result = self._run_git(
+            ["diff", "--shortstat", f"{self.base_branch}...HEAD"],
+            cwd=worktree_path
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            # Parse: "3 files changed, 50 insertions(+), 10 deletions(-)"
+            match = re.search(r"(\d+) files? changed", result.stdout)
+            if match:
+                stats["files_changed"] = int(match.group(1))
+            match = re.search(r"(\d+) insertions?", result.stdout)
+            if match:
+                stats["additions"] = int(match.group(1))
+            match = re.search(r"(\d+) deletions?", result.stdout)
+            if match:
+                stats["deletions"] = int(match.group(1))
+
+        return stats
+
+    def create_worktree(self, spec_name: str) -> WorktreeInfo:
         """
-        Create a new worktree.
+        Create a worktree for a spec.
 
         Args:
-            name: Name for the worktree directory (e.g., "auto-claude" or "worker-1")
-            branch_name: Branch name to create (default: auto-claude/{name})
+            spec_name: The spec folder name (e.g., "002-implement-memory")
 
         Returns:
-            WorktreeInfo with path and branch details
+            WorktreeInfo for the created worktree
         """
-        if branch_name is None:
-            branch_name = f"auto-claude/{name}"
+        worktree_path = self.get_worktree_path(spec_name)
+        branch_name = self.get_branch_name(spec_name)
 
-        worktree_path = self.worktrees_dir / name
-
-        # Remove existing worktree if present (from crashed previous run)
+        # Remove existing if present (from crashed previous run)
         if worktree_path.exists():
             self._run_git(["worktree", "remove", "--force", str(worktree_path)])
 
@@ -157,220 +188,110 @@ class WorktreeManager:
         ])
 
         if result.returncode != 0:
-            raise WorktreeError(f"Failed to create worktree: {result.stderr}")
-
-        info = WorktreeInfo(
-            path=worktree_path,
-            branch=branch_name,
-            base_branch=self.base_branch,
-            is_active=True,
-        )
-        self._active_worktrees[name] = info
+            raise WorktreeError(f"Failed to create worktree for {spec_name}: {result.stderr}")
 
         print(f"Created worktree: {worktree_path.name} on branch {branch_name}")
-        return info
 
-    def get_or_create_staging(self, spec_name: str) -> WorktreeInfo:
-        """
-        Get or create the staging worktree for a spec.
-
-        The staging worktree is where all work happens. It persists
-        until the user explicitly merges or discards it.
-
-        Args:
-            spec_name: Name of the spec (for branch naming)
-
-        Returns:
-            WorktreeInfo for the staging worktree
-        """
-        staging_path = self.worktrees_dir / STAGING_WORKTREE_NAME
-        branch_name = f"auto-claude/{spec_name}"
-
-        # Check if it already exists
-        if staging_path.exists():
-            # Load existing worktree info
-            result = self._run_git(["rev-parse", "--abbrev-ref", "HEAD"], cwd=staging_path)
-            if result.returncode == 0:
-                existing_branch = result.stdout.strip()
-                info = WorktreeInfo(
-                    path=staging_path,
-                    branch=existing_branch,
-                    base_branch=self.base_branch,
-                    is_active=True,
-                )
-                self._active_worktrees[STAGING_WORKTREE_NAME] = info
-                print(f"Using existing staging worktree: {staging_path}")
-                return info
-
-        # Create new staging worktree
-        return self.create(STAGING_WORKTREE_NAME, branch_name)
-
-    def staging_exists(self) -> bool:
-        """Check if a staging worktree exists."""
-        staging_path = self.worktrees_dir / STAGING_WORKTREE_NAME
-        return staging_path.exists()
-
-    def get_staging_path(self) -> Optional[Path]:
-        """Get the path to the staging worktree if it exists."""
-        staging_path = self.worktrees_dir / STAGING_WORKTREE_NAME
-        if staging_path.exists():
-            return staging_path
-        return None
-
-    def get_staging_info(self) -> Optional[WorktreeInfo]:
-        """Get info about the staging worktree."""
-        staging_path = self.worktrees_dir / STAGING_WORKTREE_NAME
-        if not staging_path.exists():
-            return None
-
-        # Get branch info
-        result = self._run_git(["rev-parse", "--abbrev-ref", "HEAD"], cwd=staging_path)
-        if result.returncode != 0:
-            return None
-
-        branch = result.stdout.strip()
-
-        info = WorktreeInfo(
-            path=staging_path,
-            branch=branch,
+        return WorktreeInfo(
+            path=worktree_path,
+            branch=branch_name,
+            spec_name=spec_name,
             base_branch=self.base_branch,
             is_active=True,
         )
-        self._active_worktrees[STAGING_WORKTREE_NAME] = info
-        return info
 
-    def remove(self, name: str, delete_branch: bool = False) -> None:
+    def get_or_create_worktree(self, spec_name: str) -> WorktreeInfo:
         """
-        Remove a worktree.
+        Get existing worktree or create a new one for a spec.
 
         Args:
-            name: Name of the worktree to remove
+            spec_name: The spec folder name
+
+        Returns:
+            WorktreeInfo for the worktree
+        """
+        existing = self.get_worktree_info(spec_name)
+        if existing:
+            print(f"Using existing worktree: {existing.path}")
+            return existing
+
+        return self.create_worktree(spec_name)
+
+    def remove_worktree(self, spec_name: str, delete_branch: bool = False) -> None:
+        """
+        Remove a spec's worktree.
+
+        Args:
+            spec_name: The spec folder name
             delete_branch: Whether to also delete the branch
         """
-        info = self._active_worktrees.get(name)
-        worktree_path = info.path if info else self.worktrees_dir / name
+        worktree_path = self.get_worktree_path(spec_name)
+        branch_name = self.get_branch_name(spec_name)
 
         if worktree_path.exists():
             result = self._run_git(["worktree", "remove", "--force", str(worktree_path)])
-
             if result.returncode == 0:
                 print(f"Removed worktree: {worktree_path.name}")
             else:
                 print(f"Warning: Could not remove worktree: {result.stderr}")
-                # Try manual removal
                 shutil.rmtree(worktree_path, ignore_errors=True)
 
-        # Delete branch if requested
-        if delete_branch and info:
-            self._run_git(["branch", "-D", info.branch])
+        if delete_branch:
+            self._run_git(["branch", "-D", branch_name])
+            print(f"Deleted branch: {branch_name}")
 
-        # Remove from tracking
-        self._active_worktrees.pop(name, None)
-
-        # Prune worktree list
         self._run_git(["worktree", "prune"])
 
-    def remove_staging(self, delete_branch: bool = True) -> None:
-        """Remove the staging worktree."""
-        self.remove(STAGING_WORKTREE_NAME, delete_branch=delete_branch)
-
-    async def merge(self, name: str, delete_after: bool = True) -> bool:
+    def merge_worktree(self, spec_name: str, delete_after: bool = False) -> bool:
         """
-        Merge a worktree's branch back to base branch.
-
-        Uses a lock to ensure only one merge happens at a time.
+        Merge a spec's worktree branch back to base branch.
 
         Args:
-            name: Name of the worktree to merge
-            delete_after: Whether to remove the worktree after merging
+            spec_name: The spec folder name
+            delete_after: Whether to remove worktree and branch after merge
 
         Returns:
-            True if merge succeeded, False otherwise
+            True if merge succeeded
         """
-        info = self._active_worktrees.get(name)
+        info = self.get_worktree_info(spec_name)
         if not info:
-            # Try to load it
-            info = self.get_staging_info() if name == STAGING_WORKTREE_NAME else None
-        if not info:
-            print(f"Worktree '{name}' not found")
+            print(f"No worktree found for spec: {spec_name}")
             return False
 
-        async with self._merge_lock:
-            return self._do_merge(info, name, delete_after)
-
-    def _do_merge(self, info: WorktreeInfo, name: str, delete_after: bool) -> bool:
-        """Actually perform the merge."""
         print(f"Merging {info.branch} into {self.base_branch}...")
 
-        # Switch to base branch in main worktree
+        # Switch to base branch in main project
         result = self._run_git(["checkout", self.base_branch])
         if result.returncode != 0:
-            print(f"  Error: Could not checkout base branch: {result.stderr}")
+            print(f"Error: Could not checkout base branch: {result.stderr}")
             return False
 
-        # Merge the worktree branch
+        # Merge the spec branch
         result = self._run_git([
             "merge", "--no-ff", info.branch,
             "-m", f"auto-claude: Merge {info.branch}"
         ])
 
         if result.returncode != 0:
-            print(f"  Merge conflict! Aborting merge...")
+            print(f"Merge conflict! Aborting merge...")
             self._run_git(["merge", "--abort"])
             return False
 
-        print(f"  Successfully merged {info.branch}")
+        print(f"Successfully merged {info.branch}")
 
-        # Clean up
         if delete_after:
-            self.remove(name, delete_branch=True)
+            self.remove_worktree(spec_name, delete_branch=True)
 
         return True
 
-    def merge_sync(self, name: str, delete_after: bool = True) -> bool:
-        """
-        Synchronous version of merge for non-async contexts.
-
-        Args:
-            name: Name of the worktree to merge
-            delete_after: Whether to remove the worktree after merging
-
-        Returns:
-            True if merge succeeded, False otherwise
-        """
-        info = self._active_worktrees.get(name)
-        if not info:
-            # Try to load it
-            info = self.get_staging_info() if name == STAGING_WORKTREE_NAME else None
-        if not info:
-            print(f"Worktree '{name}' not found")
+    def commit_in_worktree(self, spec_name: str, message: str) -> bool:
+        """Commit all changes in a spec's worktree."""
+        worktree_path = self.get_worktree_path(spec_name)
+        if not worktree_path.exists():
             return False
 
-        return self._do_merge(info, name, delete_after)
-
-    def merge_staging(self, delete_after: bool = True) -> bool:
-        """Merge the staging worktree to base branch."""
-        return self.merge_sync(STAGING_WORKTREE_NAME, delete_after=delete_after)
-
-    def commit_in_staging(self, message: str) -> bool:
-        """
-        Commit all changes in the staging worktree.
-
-        Args:
-            message: Commit message
-
-        Returns:
-            True if commit succeeded or nothing to commit
-        """
-        staging_path = self.get_staging_path()
-        if not staging_path:
-            return False
-
-        # Stage all changes
-        self._run_git(["add", "."], cwd=staging_path)
-
-        # Commit
-        result = self._run_git(["commit", "-m", message], cwd=staging_path)
+        self._run_git(["add", "."], cwd=worktree_path)
+        result = self._run_git(["commit", "-m", message], cwd=worktree_path)
 
         if result.returncode == 0:
             return True
@@ -380,153 +301,47 @@ class WorktreeManager:
             print(f"Commit failed: {result.stderr}")
             return False
 
-    def merge_branch_to_staging(self, branch_name: str) -> bool:
-        """
-        Merge a branch into the staging worktree.
+    # ==================== Listing & Discovery ====================
 
-        Used by parallel workers to merge their work into staging.
+    def list_all_worktrees(self) -> list[WorktreeInfo]:
+        """List all spec worktrees."""
+        worktrees = []
 
-        Args:
-            branch_name: Branch to merge into staging
+        if not self.worktrees_dir.exists():
+            return worktrees
 
-        Returns:
-            True if merge succeeded
-        """
-        staging_path = self.get_staging_path()
-        if not staging_path:
-            print("No staging worktree exists")
-            return False
+        for item in self.worktrees_dir.iterdir():
+            if item.is_dir() and not item.name.startswith("worker-"):
+                info = self.get_worktree_info(item.name)
+                if info:
+                    worktrees.append(info)
 
-        print(f"Merging {branch_name} into staging...")
+        return worktrees
 
-        result = self._run_git(
-            ["merge", "--no-ff", branch_name, "-m", f"auto-claude: Merge {branch_name}"],
-            cwd=staging_path
-        )
-
+    def list_all_spec_branches(self) -> list[str]:
+        """List all auto-claude branches (even if worktree removed)."""
+        result = self._run_git(["branch", "--list", "auto-claude/*"])
         if result.returncode != 0:
-            print(f"  Merge conflict! Aborting merge...")
-            self._run_git(["merge", "--abort"], cwd=staging_path)
-            return False
-
-        print(f"  Successfully merged {branch_name} into staging")
-        return True
-
-    def get_info(self, name: str) -> Optional[WorktreeInfo]:
-        """Get information about a worktree."""
-        return self._active_worktrees.get(name)
-
-    def get_worktree_path(self, name: str) -> Optional[Path]:
-        """Get the path to a worktree."""
-        info = self._active_worktrees.get(name)
-        if info:
-            return info.path
-
-        # Check if it exists but isn't tracked
-        path = self.worktrees_dir / name
-        if path.exists():
-            return path
-
-        return None
-
-    def list_worktrees(self) -> list[WorktreeInfo]:
-        """List all active worktrees."""
-        return list(self._active_worktrees.values())
-
-    def cleanup_all(self) -> None:
-        """Remove all worktrees and the .worktrees directory."""
-        # Remove all active worktrees
-        for name in list(self._active_worktrees.keys()):
-            self.remove(name, delete_branch=True)
-
-        # Prune
-        self._run_git(["worktree", "prune"])
-
-        # Remove the directory if empty
-        if self.worktrees_dir.exists():
-            try:
-                self.worktrees_dir.rmdir()
-            except OSError:
-                # Directory not empty, that's fine
-                pass
-
-    def cleanup_workers_only(self) -> None:
-        """Remove only worker worktrees, preserve staging."""
-        for name in list(self._active_worktrees.keys()):
-            if name != STAGING_WORKTREE_NAME:
-                self.remove(name, delete_branch=True)
-
-        # Prune
-        self._run_git(["worktree", "prune"])
-
-    def has_uncommitted_changes(self, in_staging: bool = False) -> bool:
-        """Check if there are uncommitted changes."""
-        cwd = self.get_staging_path() if in_staging else None
-        result = self._run_git(["status", "--porcelain"], cwd=cwd)
-        return bool(result.stdout.strip())
-
-    def get_change_summary(self, name: str = STAGING_WORKTREE_NAME) -> dict:
-        """
-        Get a summary of changes in a worktree compared to base.
-
-        Args:
-            name: Name of the worktree (default: staging)
-
-        Returns:
-            Dict with 'new_files', 'modified_files', 'deleted_files' counts
-        """
-        info = self._active_worktrees.get(name)
-        if not info:
-            info = self.get_staging_info() if name == STAGING_WORKTREE_NAME else None
-        if not info:
-            return {"new_files": 0, "modified_files": 0, "deleted_files": 0}
-
-        # Get diff stats
-        result = self._run_git([
-            "diff", "--name-status",
-            f"{info.base_branch}...{info.branch}"
-        ])
-
-        new_files = 0
-        modified_files = 0
-        deleted_files = 0
-
-        for line in result.stdout.strip().split("\n"):
-            if not line:
-                continue
-            if line.startswith("A"):
-                new_files += 1
-            elif line.startswith("M"):
-                modified_files += 1
-            elif line.startswith("D"):
-                deleted_files += 1
-
-        return {
-            "new_files": new_files,
-            "modified_files": modified_files,
-            "deleted_files": deleted_files,
-        }
-
-    def get_changed_files(self, name: str = STAGING_WORKTREE_NAME) -> list[tuple[str, str]]:
-        """
-        Get list of changed files in a worktree.
-
-        Args:
-            name: Name of the worktree (default: staging)
-
-        Returns:
-            List of (status, filepath) tuples where status is A/M/D
-        """
-        info = self._active_worktrees.get(name)
-        if not info:
-            info = self.get_staging_info() if name == STAGING_WORKTREE_NAME else None
-        if not info:
             return []
 
-        result = self._run_git([
-            "diff", "--name-status",
-            f"{info.base_branch}...{info.branch}"
-        ])
+        branches = []
+        for line in result.stdout.strip().split("\n"):
+            branch = line.strip().lstrip("* ")
+            if branch:
+                branches.append(branch)
+
+        return branches
+
+    def get_changed_files(self, spec_name: str) -> list[tuple[str, str]]:
+        """Get list of changed files in a spec's worktree."""
+        worktree_path = self.get_worktree_path(spec_name)
+        if not worktree_path.exists():
+            return []
+
+        result = self._run_git(
+            ["diff", "--name-status", f"{self.base_branch}...HEAD"],
+            cwd=worktree_path
+        )
 
         files = []
         for line in result.stdout.strip().split("\n"):
@@ -538,35 +353,261 @@ class WorktreeManager:
 
         return files
 
-    def get_test_commands(self, staging_path: Path) -> list[str]:
-        """
-        Detect likely test/run commands for the project.
+    def get_change_summary(self, spec_name: str) -> dict:
+        """Get a summary of changes in a worktree."""
+        files = self.get_changed_files(spec_name)
 
-        Returns common commands based on what files exist.
+        new_files = sum(1 for status, _ in files if status == "A")
+        modified_files = sum(1 for status, _ in files if status == "M")
+        deleted_files = sum(1 for status, _ in files if status == "D")
+
+        return {
+            "new_files": new_files,
+            "modified_files": modified_files,
+            "deleted_files": deleted_files,
+        }
+
+    def cleanup_all(self) -> None:
+        """Remove all worktrees and their branches."""
+        for worktree in self.list_all_worktrees():
+            self.remove_worktree(worktree.spec_name, delete_branch=True)
+
+    def cleanup_stale_worktrees(self) -> None:
+        """Remove worktrees that aren't registered with git."""
+        if not self.worktrees_dir.exists():
+            return
+
+        # Get list of registered worktrees
+        result = self._run_git(["worktree", "list", "--porcelain"])
+        registered_paths = set()
+        for line in result.stdout.split("\n"):
+            if line.startswith("worktree "):
+                registered_paths.add(Path(line.split(" ", 1)[1]))
+
+        # Remove unregistered directories
+        for item in self.worktrees_dir.iterdir():
+            if item.is_dir() and item not in registered_paths:
+                print(f"Removing stale worktree directory: {item.name}")
+                shutil.rmtree(item, ignore_errors=True)
+
+        self._run_git(["worktree", "prune"])
+
+    # ==================== Parallel Worker Support ====================
+
+    def create_worker_worktree(self, spec_name: str, worker_id: str, chunk_id: str) -> tuple[Path, str]:
         """
+        Create a temporary worker worktree that branches from a spec's worktree.
+
+        Args:
+            spec_name: The spec this worker is working on
+            worker_id: Unique worker identifier
+            chunk_id: The chunk being worked on
+
+        Returns:
+            Tuple of (worktree_path, branch_name)
+        """
+        spec_info = self.get_worktree_info(spec_name)
+        if not spec_info:
+            raise WorktreeError(f"Spec worktree does not exist: {spec_name}")
+
+        worker_name = f"worker-{worker_id}"
+        branch_name = f"worker-{worker_id}/{chunk_id}"
+        worktree_path = self.worktrees_dir / worker_name
+
+        # Clean up any existing worker worktree
+        if worktree_path.exists():
+            self._run_git(["worktree", "remove", "--force", str(worktree_path)])
+        self._run_git(["branch", "-D", branch_name])
+
+        # Create worker worktree branching FROM the spec's branch
+        result = self._run_git([
+            "worktree", "add", "-b", branch_name,
+            str(worktree_path), spec_info.branch
+        ])
+
+        if result.returncode != 0:
+            raise WorktreeError(f"Failed to create worker worktree: {result.stderr}")
+
+        print(f"Created worker worktree: {worker_name} (from {spec_info.branch})")
+        return worktree_path, branch_name
+
+    def merge_worker_to_spec(self, spec_name: str, worker_branch: str) -> bool:
+        """
+        Merge a worker's branch back into the spec's worktree.
+
+        Args:
+            spec_name: The spec to merge into
+            worker_branch: The worker branch to merge
+
+        Returns:
+            True if merge succeeded
+        """
+        spec_path = self.get_worktree_path(spec_name)
+        if not spec_path.exists():
+            print(f"Spec worktree does not exist: {spec_name}")
+            return False
+
+        print(f"Merging {worker_branch} into {spec_name}...")
+
+        result = self._run_git(
+            ["merge", "--no-ff", worker_branch, "-m", f"auto-claude: Merge {worker_branch}"],
+            cwd=spec_path
+        )
+
+        if result.returncode != 0:
+            print(f"Merge conflict! Aborting...")
+            self._run_git(["merge", "--abort"], cwd=spec_path)
+            return False
+
+        print(f"Successfully merged {worker_branch}")
+        return True
+
+    def cleanup_worker_worktree(self, worker_id: str, branch_name: str) -> None:
+        """Clean up a worker's temporary worktree and branch."""
+        worker_name = f"worker-{worker_id}"
+        worktree_path = self.worktrees_dir / worker_name
+
+        if worktree_path.exists():
+            self._run_git(["worktree", "remove", "--force", str(worktree_path)])
+
+        self._run_git(["branch", "-D", branch_name])
+        self._run_git(["worktree", "prune"])
+
+    def cleanup_all_workers(self) -> None:
+        """Remove all worker worktrees (preserves spec worktrees)."""
+        if not self.worktrees_dir.exists():
+            return
+
+        for item in self.worktrees_dir.iterdir():
+            if item.is_dir() and item.name.startswith("worker-"):
+                self._run_git(["worktree", "remove", "--force", str(item)])
+
+        # Clean up worker branches
+        result = self._run_git(["branch", "--list", "worker-*/*"])
+        if result.returncode == 0:
+            for line in result.stdout.strip().split("\n"):
+                branch = line.strip().lstrip("* ")
+                if branch:
+                    self._run_git(["branch", "-D", branch])
+
+        self._run_git(["worktree", "prune"])
+
+    def get_test_commands(self, spec_name: str) -> list[str]:
+        """Detect likely test/run commands for the project."""
+        worktree_path = self.get_worktree_path(spec_name)
         commands = []
 
-        # Check for package.json (Node.js)
-        if (staging_path / "package.json").exists():
+        if (worktree_path / "package.json").exists():
             commands.append("npm install && npm run dev")
             commands.append("npm test")
 
-        # Check for requirements.txt (Python)
-        if (staging_path / "requirements.txt").exists():
+        if (worktree_path / "requirements.txt").exists():
             commands.append("pip install -r requirements.txt")
 
-        # Check for Cargo.toml (Rust)
-        if (staging_path / "Cargo.toml").exists():
+        if (worktree_path / "Cargo.toml").exists():
             commands.append("cargo run")
             commands.append("cargo test")
 
-        # Check for go.mod (Go)
-        if (staging_path / "go.mod").exists():
+        if (worktree_path / "go.mod").exists():
             commands.append("go run .")
             commands.append("go test ./...")
 
-        # Default
         if not commands:
             commands.append("# Check the project's README for run instructions")
 
         return commands
+
+    # ==================== Backward Compatibility ====================
+    # These methods provide backward compatibility with the old single-worktree API
+
+    def get_staging_path(self) -> Optional[Path]:
+        """
+        Backward compatibility: Get path to any existing spec worktree.
+        Prefer using get_worktree_path(spec_name) instead.
+        """
+        worktrees = self.list_all_worktrees()
+        if worktrees:
+            return worktrees[0].path
+        return None
+
+    def get_staging_info(self) -> Optional[WorktreeInfo]:
+        """
+        Backward compatibility: Get info about any existing spec worktree.
+        Prefer using get_worktree_info(spec_name) instead.
+        """
+        worktrees = self.list_all_worktrees()
+        if worktrees:
+            return worktrees[0]
+        return None
+
+    def merge_staging(self, delete_after: bool = True) -> bool:
+        """
+        Backward compatibility: Merge first found worktree.
+        Prefer using merge_worktree(spec_name) instead.
+        """
+        worktrees = self.list_all_worktrees()
+        if worktrees:
+            return self.merge_worktree(worktrees[0].spec_name, delete_after)
+        return False
+
+    def remove_staging(self, delete_branch: bool = True) -> None:
+        """
+        Backward compatibility: Remove first found worktree.
+        Prefer using remove_worktree(spec_name) instead.
+        """
+        worktrees = self.list_all_worktrees()
+        if worktrees:
+            self.remove_worktree(worktrees[0].spec_name, delete_branch)
+
+    def get_or_create_staging(self, spec_name: str) -> WorktreeInfo:
+        """
+        Backward compatibility: Alias for get_or_create_worktree.
+        """
+        return self.get_or_create_worktree(spec_name)
+
+    def staging_exists(self) -> bool:
+        """
+        Backward compatibility: Check if any spec worktree exists.
+        Prefer using worktree_exists(spec_name) instead.
+        """
+        return len(self.list_all_worktrees()) > 0
+
+    def commit_in_staging(self, message: str) -> bool:
+        """
+        Backward compatibility: Commit in first found worktree.
+        Prefer using commit_in_worktree(spec_name, message) instead.
+        """
+        worktrees = self.list_all_worktrees()
+        if worktrees:
+            return self.commit_in_worktree(worktrees[0].spec_name, message)
+        return False
+
+    def merge_branch_to_staging(self, branch_name: str) -> bool:
+        """
+        Backward compatibility: Merge a branch into first found worktree.
+        Prefer using merge_worker_to_spec(spec_name, branch_name) instead.
+        """
+        worktrees = self.list_all_worktrees()
+        if worktrees:
+            return self.merge_worker_to_spec(worktrees[0].spec_name, branch_name)
+        return False
+
+    def cleanup_workers_only(self) -> None:
+        """
+        Backward compatibility: Alias for cleanup_all_workers.
+        """
+        self.cleanup_all_workers()
+
+    def has_uncommitted_changes(self, in_staging: bool = False) -> bool:
+        """Check if there are uncommitted changes."""
+        worktrees = self.list_all_worktrees()
+        if in_staging and worktrees:
+            cwd = worktrees[0].path
+        else:
+            cwd = None
+        result = self._run_git(["status", "--porcelain"], cwd=cwd)
+        return bool(result.stdout.strip())
+
+
+# Keep STAGING_WORKTREE_NAME for backward compatibility in imports
+STAGING_WORKTREE_NAME = "auto-claude"
