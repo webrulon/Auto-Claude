@@ -599,7 +599,10 @@
   "roadmap": {
     "taskCompleted": "Terminé",
     "taskDeleted": "Supprimé",
-    "taskArchived": "Archivé"
+    "taskArchived": "Archivé",
+    "showMoreFeatures": "Afficher {{count}} fonctionnalité supplémentaire",
+    "showMoreFeatures_plural": "Afficher {{count}} fonctionnalités supplémentaires",
+    "showLessFeatures": "Afficher moins"
   },
   "roadmapGeneration": {
     "progress": "Progression",
