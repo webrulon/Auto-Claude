@@ -6,6 +6,7 @@ import { app } from 'electron';
 import { findPythonCommand, getBundledPythonPath } from './python-detector';
 import { isLinux, isWindows, getPathDelimiter } from './platform';
 import { getIsolatedGitEnv } from './utils/git-isolation';
+import { normalizeEnvPathKey } from './agent/env-utils';
 
 export interface PythonEnvStatus {
   ready: boolean;
@@ -218,7 +219,8 @@ if sys.version_info >= (3, 12):
 `;
       execSync(`"${venvPython}" -c "${checkScript.replace(/\n/g, '; ').replace(/; ; /g, '; ')}"`, {
         stdio: 'pipe',
-        timeout: 15000
+        timeout: 15000,
+        encoding: 'utf-8'
       });
       return true;
     } catch {
@@ -249,8 +251,9 @@ if sys.version_info >= (3, 12):
       // For commands like "py -3", we need to resolve to the actual executable
       const pythonPath = execSync(`${pythonCmd} -c "import sys; print(sys.executable)"`, {
         stdio: 'pipe',
-        timeout: 5000
-      }).toString().trim();
+        timeout: 5000,
+        encoding: 'utf-8'
+      }).trim();
 
       console.log(`[PythonEnvManager] Found Python at: ${pythonPath}`);
       return pythonPath;
@@ -287,7 +290,8 @@ if sys.version_info >= (3, 12):
     return new Promise((resolve) => {
       const proc = spawn(systemPython, ['-m', 'venv', venvPath], {
         cwd: this.autoBuildSourcePath!,
-        stdio: 'pipe'
+        stdio: 'pipe',
+        env: { ...process.env, PYTHONIOENCODING: 'utf-8', PYTHONUTF8: '1' }
       });
 
       // Track the process for cleanup on app exit
@@ -313,7 +317,7 @@ if sys.version_info >= (3, 12):
       }, PythonEnvManager.VENV_CREATION_TIMEOUT_MS);
 
       proc.stderr?.on('data', (data) => {
-        stderr += data.toString();
+        stderr += data.toString('utf-8');
       });
 
       proc.on('close', (code) => {
@@ -358,12 +362,13 @@ if sys.version_info >= (3, 12):
     return new Promise((resolve) => {
       const proc = spawn(venvPython, ['-m', 'ensurepip'], {
         cwd: this.autoBuildSourcePath!,
-        stdio: 'pipe'
+        stdio: 'pipe',
+        env: { ...process.env, PYTHONIOENCODING: 'utf-8', PYTHONUTF8: '1' }
       });
 
       let stderr = '';
       proc.stderr?.on('data', (data) => {
-        stderr += data.toString();
+        stderr += data.toString('utf-8');
       });
 
       proc.on('close', (code) => {
@@ -412,16 +417,17 @@ if sys.version_info >= (3, 12):
       // Use python -m pip for better compatibility across Python versions
       const proc = spawn(venvPython, ['-m', 'pip', 'install', '-r', requirementsPath], {
         cwd: this.autoBuildSourcePath!,
-        stdio: 'pipe'
+        stdio: 'pipe',
+        env: { ...process.env, PYTHONIOENCODING: 'utf-8', PYTHONUTF8: '1' }
       });
 
       let stdout = '';
       let stderr = '';
 
       proc.stdout?.on('data', (data) => {
-        stdout += data.toString();
+        stdout += data.toString('utf-8');
         // Emit progress updates for long-running installations
-        const lines = data.toString().split('\n');
+        const lines = data.toString('utf-8').split('\n');
         for (const line of lines) {
           if (line.includes('Installing') || line.includes('Successfully')) {
             this.emit('status', line.trim());
@@ -430,7 +436,7 @@ if sys.version_info >= (3, 12):
       });
 
       proc.stderr?.on('data', (data) => {
-        stderr += data.toString();
+        stderr += data.toString('utf-8');
       });
 
       proc.on('close', (code) => {
@@ -721,17 +727,10 @@ if sys.version_info >= (3, 12):
       const pywin32System32 = path.join(this.sitePackagesPath, 'pywin32_system32');
 
       // Add pywin32_system32 to PATH for DLL loading
-      // Fix PATH case sensitivity: On Windows, env vars are case-insensitive but Node.js
-      // preserves case. If we have both 'PATH' and 'Path', Node.js lexicographically sorts
-      // and uses the first match, causing issues. Normalize to single 'PATH' key.
-      // See: https://github.com/nodejs/node/issues/9157
-      const pathKey = Object.keys(baseEnv).find(k => k.toUpperCase() === 'PATH');
-      const currentPath = pathKey ? baseEnv[pathKey] : '';
-
-      // Remove any existing PATH variants to avoid duplicates
-      if (pathKey && pathKey !== 'PATH') {
-        delete baseEnv[pathKey];
-      }
+      // Normalize to single 'PATH' key before reading/writing, using the shared utility.
+      // This prevents duplicate 'Path'/'PATH' keys that cause DLL-load failures on Windows.
+      normalizeEnvPathKey(baseEnv);
+      const currentPath = baseEnv['PATH'] ?? '';
 
       if (currentPath && !currentPath.includes(pywin32System32)) {
         windowsEnv['PATH'] = `${pywin32System32};${currentPath}`;
@@ -748,8 +747,11 @@ if sys.version_info >= (3, 12):
       ...windowsEnv,
       // Don't write bytecode - not needed and avoids permission issues
       PYTHONDONTWRITEBYTECODE: '1',
+      // Force unbuffered stdout/stderr so progress updates reach Electron immediately
+      PYTHONUNBUFFERED: '1',
       // Use UTF-8 encoding
       PYTHONIOENCODING: 'utf-8',
+      PYTHONUTF8: '1',
       // Disable user site-packages to avoid conflicts
       PYTHONNOUSERSITE: '1',
       // Override PYTHONPATH if we have bundled packages
